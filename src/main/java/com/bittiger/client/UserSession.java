@@ -10,6 +10,7 @@ import java.sql.Statement;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.bittiger.logic.LRUCache;
 import com.bittiger.logic.LoadBalancer;
 import com.bittiger.logic.Server;
 import com.bittiger.querypool.QueryMetaData;
@@ -21,20 +22,19 @@ public class UserSession extends Thread {
 	private boolean suspendThread = false;
 	private BlockingQueue<Integer> queue;
 	private int id;
+	private int lruCacheCap = 10;
+	private LRUCache lruCache;
 
-	private Connection writeConn;
+	private static transient final Logger LOG = LoggerFactory.getLogger(UserSession.class);
 
-	private static transient final Logger LOG = LoggerFactory
-			.getLogger(ClientEmulator.class);
-
-	public UserSession(int id, ClientEmulator client,
-			BlockingQueue<Integer> bQueue) {
+	public UserSession(int id, ClientEmulator client, BlockingQueue<Integer> bQueue) {
 		super("UserSession" + id);
 		this.id = id;
 		this.queue = bQueue;
 		this.client = client;
 		this.tpcw = client.getTpcw();
 		this.rand = new Random();
+		this.lruCache = new LRUCache(lruCacheCap);
 	}
 
 	private long TPCWthinkTime(double mean) {
@@ -90,10 +90,7 @@ public class UserSession extends Thread {
 		if (sql.contains("b")) {
 			return getNextReadConnection(client.getLoadBalancer());
 		} else {
-			if (writeConn == null) {
-				writeConn = getNextWriteConnection(client.getLoadBalancer());
-			}
-			return writeConn;
+			return getNextWriteConnection(client.getLoadBalancer());
 		}
 	}
 
@@ -104,8 +101,7 @@ public class UserSession extends Thread {
 			Class.forName("com.mysql.jdbc.Driver").newInstance();
 			// DriverManager.setLoginTimeout(5);
 			server = loadBalancer.getWriteQueue();
-			connection = (Connection) DriverManager.getConnection(
-					Utilities.getUrl(server), client.getTpcw().username,
+			connection = (Connection) DriverManager.getConnection(Utilities.getUrl(server), client.getTpcw().username,
 					client.getTpcw().password);
 			connection.setAutoCommit(true);
 		} catch (Exception e) {
@@ -116,47 +112,26 @@ public class UserSession extends Thread {
 	}
 
 	public Connection getNextReadConnection(LoadBalancer loadBalancer) {
-		Server server = null;
-		Connection connection = null;
-		while (connection == null) {
-			int tryTime = 0;
-			server = loadBalancer.getNextReadServer();
-			while (connection == null && tryTime++ < Utilities.retryTimes) {
-				try {
-					Class.forName("com.mysql.jdbc.Driver").newInstance();
-					connection = (Connection) DriverManager.getConnection(
-							Utilities.getUrl(server),
-							client.getTpcw().username,
-							client.getTpcw().password);
-					connection.setAutoCommit(true);
-				} catch (Exception e) {
-					LOG.error(e.toString());
-				}
-			}
-			if (connection == null) {
-				LOG.error(server.getIp() + " is down. ");
-				loadBalancer.getReadQueue().remove(server);
-				loadBalancer.detectFailure();
-			} else {
-				LOG.debug("choose read server as " + server.getIp());
-				return connection;
-			}
+		try {
+			Class.forName("com.mysql.jdbc.Driver").newInstance();
+			Server server = loadBalancer.getNextReadServer();
+			Connection connection = (Connection) DriverManager.getConnection(
+					Utilities.getUrl(server), client.getTpcw().username,
+					client.getTpcw().password);
+			connection.setAutoCommit(true);
+			return connection;
+		} catch (Exception ex) {
+			throw new RuntimeException(ex);
 		}
-		return null;
 	}
 
 	public void run() {
-		try {
-			synchronized (this) {
-				while (suspendThread)
-					wait();
-			}
-		} catch (InterruptedException e) {
-			LOG.error("Error while running session: " + e.getMessage());
-		}
-
-		while (!client.isEndOfSimulation() && !suspendThread) {
+		while (!client.isEndOfSimulation()) {
 			try {
+				synchronized (this) {
+					while (suspendThread)
+						wait();
+				}
 				// decide of closed or open system
 				double r = rand.nextDouble();
 				if (r < tpcw.mixRate) {
@@ -165,43 +140,47 @@ public class UserSession extends Thread {
 				} else {
 					Thread.sleep((long) ((float) TPCWthinkTime(tpcw.TPCmean)));
 				}
+			} catch (Exception ex) {
+				LOG.error("Error while running session: " + ex.getMessage());
+			}
 
-				String queryclass = computeNextSql(tpcw.rwratio, tpcw.read,
-						tpcw.write);
-				Connection connection = getNextConnection(queryclass);
+			String queryclass = computeNextSql(tpcw.rwratio, tpcw.read, tpcw.write);
+			Connection connection = null;
+			Statement stmt = null;
+			try {
+				lruCache.put(queryclass, 1);
+				connection = getNextConnection(queryclass);
 				String classname = "com.bittiger.querypool." + queryclass;
-				QueryMetaData query = (QueryMetaData) Class.forName(classname)
-						.newInstance();
+				QueryMetaData query = (QueryMetaData) Class.forName(classname).newInstance();
 				String command = query.getQueryStr();
-
-				Statement stmt = connection.createStatement();
+				stmt = connection.createStatement();
 				if (queryclass.contains("b")) {
 					long start = System.currentTimeMillis();
 					stmt.executeQuery(command);
 					long end = System.currentTimeMillis();
-					client.getMonitor().addQuery(this.id, queryclass, start,
-							end);
-					stmt.close();
-					connection.close();
+					client.getMonitor().addQuery(this.id, queryclass, start, end);
 				} else {
 					long start = System.currentTimeMillis();
 					stmt.executeUpdate(command);
 					long end = System.currentTimeMillis();
-					client.getMonitor().addQuery(this.id, queryclass, start,
-							end);
-					stmt.close();
+					client.getMonitor().addQuery(this.id, queryclass, start, end);
 				}
 			} catch (Exception ex) {
-				LOG.error("Error while running session: " + ex.getMessage());
+				LOG.error("Error while executing query: " + ex.getMessage());
+			} finally {
+				if (stmt != null)
+					try {
+						stmt.close();
+					} catch (SQLException e) {
+						e.printStackTrace();
+					}
+				if (connection != null)
+					try {
+						connection.close();
+					} catch (SQLException e) {
+						e.printStackTrace();
+					}
 			}
 		}
-		try {
-			if (writeConn != null) {
-				writeConn.close();
-			}
-		} catch (SQLException ex) {
-			LOG.error("Error while close connection " + ex.getMessage());
-		}
-		client.increaseThread();
 	}
 }

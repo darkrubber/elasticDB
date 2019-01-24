@@ -38,9 +38,10 @@ string=$(ssh root@$MASTER "echo "show master status" | mysql --user="$MYSQL_USER
 var=$(echo $string | awk -F" " '{print $1,$2,$3,$4,$5,$6}')
 set -- $var
 echo "bin is $5, pos is $6"
+# sed -i has problem in mac, we need to use -e if we would like to be compatible with linux
 sed -e "s/vader-1-vm3/$MASTER/g" $CURRENT_HOME/slave-template.sql > $CURRENT_HOME/grantSlave.sql
-sed -i -e "s/mysql-bin.000002/$5/g" $CURRENT_HOME/grantSlave.sql
-sed -i -e "s/=445/=$6/g" $CURRENT_HOME/grantSlave.sql
+sed -e "s/mysql-bin.000002/$5/g" $CURRENT_HOME/grantSlave.sql > $CURRENT_HOME/grantSlave.sql-bin
+sed -e "s/=445/=$6/g" $CURRENT_HOME/grantSlave.sql-bin > $CURRENT_HOME/grantSlave.sql
 
 echo "step 4 restart slaves"
 for (( i = 0 ; i < ${#SLAVE[@]} ; i++ ))
@@ -49,7 +50,7 @@ target=${SLAVE[$i]}
 echo "restart $target"
 scp $CURRENT_HOME/grantSlave.sql root@$target:$SCRIPT_HOME/grantSlave.sql
 servernum=$(echo $i+2 | bc)
-ssh root@$target "$SCRIPT_HOME/initSlave.sh $MASTER `expr $servernum`"
+ssh root@$target "$SCRIPT_HOME/initSlave.sh $MASTER `expr $servernum` start"
 ssh root@$target "mysql --user="$MYSQL_USERNAME" --password="$MYSQL_PASSWORD" < $SCRIPT_HOME/grantSlave.sql"
 ssh root@$target "rm -rf $SCRIPT_HOME/grantSlave.sql"
 echo "$target restarts"
@@ -60,15 +61,13 @@ for (( i = 0 ; i < ${#CANDIDATE[@]} ; i++ ))
 do
 target=${CANDIDATE[$i]}
 echo "restart $target"
-scp $CURRENT_HOME/grantSlave.sql root@$target:$SCRIPT_HOME/grantSlave.sql
 servernum=$(echo $i+100 | bc)
-ssh root@$target "$SCRIPT_HOME/initSlave.sh $MASTER `expr $servernum`"
-ssh root@$target "mysql --user="$MYSQL_USERNAME" --password="$MYSQL_PASSWORD" < $SCRIPT_HOME/grantSlave.sql"
-ssh root@$target "rm -rf $SCRIPT_HOME/grantSlave.sql"
+ssh root@$target "$SCRIPT_HOME/initSlave.sh $MASTER `expr $servernum` stop"
 echo "$target restarts"
 done
 
-rm -rf $CURRENT_HOME/grantSlave.sql
+#finally remove the temp files
+rm -rf $CURRENT_HOME/grantSlave.sql*
 
 echo "finish"
 
